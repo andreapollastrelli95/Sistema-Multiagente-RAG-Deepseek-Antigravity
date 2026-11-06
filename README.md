@@ -1,105 +1,59 @@
-# Sistema RAG con Modelli Locali Ollama (deepseek-r1:8b)
+# RAG locale con ricerca ibrida
 
-Un sistema di **Retrieval-Augmented Generation (RAG)** completo, veloce e sicuro per analizzare ed effettuare domande in linguaggio naturale sui tuoi documenti locali (`.txt`, `.pdf`, `.md`).
+Interroga documenti `.txt`, `.md` e `.pdf` in linguaggio naturale, in italiano, con modelli eseguiti sul proprio computer tramite [Ollama](https://ollama.com). Documenti e domande restano in locale.
 
-I dati rimangono al 100% sulla tua macchina:
-- **LLM locale**: `deepseek-r1:8b` (in esecuzione su `http://localhost:11434`)
-- **Embeddings semantici**: `nomic-embed-text` (Ollama)
-- **Motore di ricerca**: Ricerca semantica vettoriale su coseno con fallback integrato TF-IDF (`scikit-learn`)
-- **Parser PDF**: `pypdf` ad alte prestazioni
-- **Interfaccia CLI**: Basata su `rich` con supporto a streaming in tempo reale, tabelle delle fonti ed evidenziazione della fase di ragionamento (*thinking* di DeepSeek).
+Ogni risposta indica le fonti usate e passa da un controllo automatico di citazioni, numeri e codici.
 
----
+## Come funziona
 
-## 📁 Struttura del Progetto
+1. **Chunking:** divide i testi rispettando titoli, paragrafi e frasi.
+2. **Ricerca ibrida:** unisce con Reciprocal Rank Fusion la similarità degli embedding e BM25, con un piccolo bonus per i codici esatti come `SN-900`.
+3. **Risposta:** `deepseek-r1:8b` risponde usando solo i frammenti recuperati e li cita come `[Fonte 1]`.
+4. **Controllo euristico:** segnala citazioni inesistenti e numeri, date o codici assenti dalle fonti.
 
-```
-Progetti Ai/
-│
-├── rag_demo.py                  # Script principale del sistema RAG
-├── .rag_cache.json              # Cache automatica degli embedding vettoriali (generata al primo avvio)
-├── README.md                    # Questa guida
-│
-└── documenti/                   # Cartella per i tuoi file da analizzare
-    ├── guida_progetto.txt       # Esempio testuale (.txt)
-    └── scheda_dispositivi.pdf   # Esempio PDF (.pdf)
-```
+Il controllo non usa un LLM e non comprende il significato delle frasi: un esito positivo non dimostra che la risposta sia corretta.
 
----
+Se gli embedding non sono disponibili durante l'indicizzazione, il sistema passa a TF-IDF. Per generare la risposta Ollama resta necessario.
 
-## 🚀 Prerequisiti e Avvio
-
-1. Assicurati che **Ollama** sia in esecuzione in background:
-   ```bash
-   ollama list
-   ```
-   Dovresti visualizzare `deepseek-r1:8b` e `nomic-embed-text`. Se necessario, puoi scaricarli con:
-   ```bash
-   ollama pull deepseek-r1:8b
-   ollama pull nomic-embed-text
-   ```
-
-2. Le dipendenze Python necessarie (`pypdf`, `rich`, `requests`, `scikit-learn`, `numpy`, `langchain-text-splitters`) sono già installate.
-
----
-
-## 💡 Modalità d'Uso
-
-### 1. Modalità Interattiva (Shell nel Terminale)
-Avvia la sessione interattiva di domande e risposte:
-```bash
-python rag_demo.py
-```
-
-All'interno della shell potrai digitare le tue domande oppure utilizzare i seguenti comandi:
-- `fonti`: Mostra una tabella dettagliata con i frammenti documentali usati nell'ultima risposta (file, pagina, punteggio ibrido, punteggio denso e BM25, anteprima).
-- `memoria`: Visualizza i turni recenti della conversazione corrente (utile per monitorare il contesto).
-- `pulisci`: Azzera la cronologia della conversazione per avviare una nuova sessione da zero.
-- `ricarica`: Riscansiona la cartella documenti e rigenera l'indice vettoriale e BM25 (utile dopo modifiche ai file).
-- `think`: Attiva o disattiva la visualizzazione a schermo dei passaggi di ragionamento (`<think>`) del modello DeepSeek.
-- `esci` o `q`: Termina la sessione.
-
----
-
-### 2. Modalità a Singola Domanda (One-Shot)
-Puoi passare una domanda direttamente come argomento da riga di comando:
-```bash
-python rag_demo.py "Quali sono le specifiche dei sensori ambientali SN-900?"
-```
+## Avvio
 
 ```bash
-python rag_demo.py "Chi è il coordinatore tecnico del Progetto Aurora e ogni quanto rilasciano aggiornamenti?"
+pip install -r requirements.txt
+ollama pull deepseek-r1:8b
+ollama pull nomic-embed-text
+
+python rag_demo.py                                          # shell interattiva
+python rag_demo.py "Chi è il coordinatore del Progetto Aurora?"   # domanda singola
 ```
 
----
+La cartella `documenti/` contiene due file dimostrativi con dati fittizi. Per usare i propri: `python rag_demo.py --docs-dir percorso/cartella`.
 
-## ⚙️ Opzioni da Riga di Comando
-
-| Argomento | Descrizione | Default |
+| Opzione | Effetto | Predefinito |
 |---|---|---|
-| `query` | Domanda opzionale. Se omessa, avvia la shell interattiva. | `None` |
-| `--docs-dir`, `-d` | Cartelle o singoli file da analizzare. | `.` e `documenti` |
-| `--top-k`, `-k` | Numero di frammenti più rilevanti da passare al modello. | `3` |
-| `--reload`, `-r` | Forza la rigenerazione della cache degli embedding. | `False` |
-| `--no-thinking` | Nasconde a terminale i passaggi intermedi `<think>`. | `False` |
-| `--no-validation` | Disabilita il passaggio di verifica dell'Agente 2 (Validatore). | `False` |
-| `--model`, `-m` | Nome del modello LLM su Ollama. | `deepseek-r1:8b` |
-| `--embed-model`, `-e` | Nome del modello di embedding su Ollama. | `nomic-embed-text` |
+| `--docs-dir`, `-d` | Cartelle o file da indicizzare | `documenti`, `docs` |
+| `--top-k`, `-k` | Frammenti passati al modello | `3` |
+| `--reload`, `-r` | Rigenera la cache degli embedding | disattivo |
+| `--no-thinking` | Nasconde il ragionamento del modello | disattivo |
+| `--no-validation` | Disattiva il controllo | disattivo |
+| `--model`, `-m` | Modello LLM | `deepseek-r1:8b` |
+| `--embed-model`, `-e` | Modello di embedding | `nomic-embed-text` |
 
----
+Comandi nella shell: `fonti`, `memoria`, `pulisci`, `ricarica`, `think`, `esci`.
 
-## ⚡ Caratteristiche Chiave Avanzate
+## Test e valutazione
 
-1. **Hybrid Search & RRF Reranking**:
-   Combina la ricerca semantica vettoriale (cosine similarity) con la ricerca lessicale BM25Okapi e un boost per token tecnici esatti. Impedisce la perdita di codici hardware (es. `SN-900`), versioni software (`v1.2.0`), date e codici alfanumerici.
-2. **Chunking Semantico Strutturato**:
-   Segmenta i documenti rispettando intestazioni Markdown (`#`, `##`), sezioni numerate, doppi ritorni a capo (paragrafi) e confini di frase completi, evitando frammentazioni artificiali a metà frase.
-3. **Architettura Multi-Agente (Ricercatore + Validatore/Revisore)**:
-   - **Agente 1 (Ricercatore)**: Esegue il retrieval ibrido, contestualizza la richiesta e formula i contesti documentali strutturati.
-   - **Agente 2 (Validatore/Revisore)**: Ispeziona la risposta di DeepSeek-R1 prima dell'invio all'utente, verifica l'aderenza fattuale alle fonti fornite, convalida le citazioni esplicite `[Fonte X]` e segnala o elimina eventuali allucinazioni.
-4. **Chat Memory (Memoria di Conversazione)**:
-   Mantiene una finestra scorrevole dei turni di dialogo precedenti, consentendo follow-up questions fluide con risoluzione automatica delle domande con riferimenti impliciti.
-5. **Caching Intelligente degli Embedding (`.rag_cache.json`)**:
-   Calcola un hash MD5 dello stato dei file. Se i documenti non sono stati modificati, l'avvio e l'indicizzazione sono istantanei.
-6. **Fallback Resiliente**:
-   Se per qualsiasi motivo il modello di embedding locale o Ollama non risponde, il sistema attiva automaticamente il calcolo TF-IDF / BM25 senza bloccarsi.
+```bash
+pip install -r requirements-dev.txt
+pytest
+python evaluation/valuta_retrieval.py
+```
+
+Sulle 12 domande di `evaluation/domande.json`, in modalità TF-IDF + BM25 senza Ollama, il frammento corretto è tra i primi 3 in tutti i casi (hit rate 1,00, MRR 0,96).
+
+Il corpus ha solo due documenti e 7 frammenti: la misura serve a intercettare regressioni, non a stimare la qualità su documenti reali. Con Ollama attivo si può ripetere usando `--ollama`.
+
+## Limiti
+
+- La qualità della risposta non è valutata: la misura riguarda solo il recupero dei frammenti.
+- I PDF scansionati non sono supportati perché manca l'OCR.
+- Gli indici stanno in memoria e la cache è un file JSON: la soluzione è adatta a piccole raccolte.

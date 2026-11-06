@@ -1,5 +1,5 @@
 """
-rag_demo.py - Sistema RAG Avanzato ad Alta Precisione & Multi-Agente
+rag_demo.py - Sistema RAG locale con ricerca ibrida e controllo delle risposte
 Modello LLM: deepseek-r1:8b (Ollama)
 Modello Embeddings: nomic-embed-text (Ollama) + Motore BM25 (Hybrid Search)
 Supporto: Documenti .txt, .pdf, .md
@@ -7,9 +7,10 @@ Supporto: Documenti .txt, .pdf, .md
 Caratteristiche Architetturali Avanzate:
 1. Hybrid Search & RRF Reranking (Ricerca Semantica Vettoriale + Ricerca Lessicale BM25)
 2. Chunking Semantico (Suddivisione basata su paragrafi, sezioni logiche e confini di frase)
-3. Architettura Multi-Agente:
-   - Agente 1 (Ricercatore): Retrieval ibrido, contestualizzazione ed estrazione passaggi
-   - Agente 2 (Validatore/Revisore): Verifica anti-allucinazione e conformità citazioni fonti
+3. Due fasi distinte:
+   - Agente 1 (Ricercatore): retrieval ibrido, contestualizzazione ed estrazione passaggi
+   - Agente 2 (Validatore): controllo euristico di citazioni, numeri e codici. Non usa un LLM
+     e non dimostra che una risposta sia vera: segnala cio' che non trova nelle fonti.
 4. Mantenimento della Memoria (Chat Memory) per conversazioni multi-turno
 """
 
@@ -24,7 +25,7 @@ import argparse
 import logging
 from pathlib import Path
 from collections import Counter
-from typing import List, Dict, Any, Tuple, Optional, Set
+from typing import List, Dict, Any, Tuple, Optional
 
 # Assicura il corretto encoding UTF-8 sulla console Windows
 if sys.platform == "win32":
@@ -43,6 +44,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 
 try:
@@ -51,12 +53,6 @@ try:
 except ImportError:
     HAS_PYPDF = False
 
-try:
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-    HAS_LANGCHAIN_SPLITTER = True
-except ImportError:
-    HAS_LANGCHAIN_SPLITTER = False
-
 console = Console(highlight=False)
 
 # Configurazioni di default
@@ -64,7 +60,10 @@ DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_LLM_MODEL = "deepseek-r1:8b"
 DEFAULT_EMBED_MODEL = "nomic-embed-text"
 CACHE_FILE = ".rag_cache.json"
+DEFAULT_DOC_DIRS = ["documenti", "docs"]
+INDEX_VERSION = "2"  # Da incrementare quando cambiano chunking o embedding
 IGNORED_DIRS = {".git", ".gemini", "venv", ".venv", "__pycache__", "site-packages", ".agents"}
+ABBREVIATIONS = ("es.", "pag.", "vs.", "e.g.", "art.", "n.", "dott.", "sig.", "ing.")
 
 
 # =====================================================================
@@ -168,13 +167,20 @@ class SemanticTextSplitter:
 
     @staticmethod
     def _split_into_sentences(paragraph: str) -> List[str]:
-        """Divide un paragrafo in frasi preservando punteggiatura e codici/abbreviazioni."""
-        # Regex avanzata che non spezza su 'es.', 'v1.2', 'SN-900' o numeri decimali
-        sentence_end = re.compile(
-            r"(?<!\be\.g)(?<!\bes)(?<!\bvs)(?<!\bv\d)(?<!\bpag)(?<=[.?!])\s+(?=[A-Z0-9\"\'])"
-        )
-        sentences = sentence_end.split(paragraph)
-        return [s.strip() for s in sentences if s.strip()]
+        """Divide un paragrafo in frasi senza spezzare abbreviazioni e versioni."""
+        raw = re.split(r"(?<=[.?!])\s+(?=[A-ZÀ-Ý0-9\"\'])", paragraph)
+        sentences: List[str] = []
+        for part in raw:
+            part = part.strip()
+            if not part:
+                continue
+            if sentences:
+                last_word = sentences[-1].rsplit(None, 1)[-1].lower()
+                if last_word in ABBREVIATIONS or re.fullmatch(r"v\d+\.", last_word):
+                    sentences[-1] = f"{sentences[-1]} {part}"
+                    continue
+            sentences.append(part)
+        return sentences
 
     def split_text(self, text: str) -> List[str]:
         """Esegue il chunking semantico strutturato."""
@@ -250,7 +256,10 @@ class DocumentLoader:
 
     @staticmethod
     def is_ignored(path: Path) -> bool:
+        """Ignora cartelle tecniche e nascoste; '.' e '..' sono percorsi validi."""
         for part in path.parts:
+            if part in (".", ".."):
+                continue
             if part in IGNORED_DIRS or part.startswith("."):
                 return True
         return False
@@ -301,7 +310,9 @@ class DocumentLoader:
                 files = list(p.rglob("*"))
 
             for file_path in files:
-                if file_path.is_file() and not cls.is_ignored(file_path):
+                # Il controllo vale solo dentro la cartella scelta dall'utente
+                relative = file_path.relative_to(p) if p.is_dir() else Path(file_path.name)
+                if file_path.is_file() and not cls.is_ignored(relative):
                     if file_path.suffix.lower() in [".txt", ".pdf", ".md"]:
                         content_list = cls.load_file(file_path)
                         if content_list:
@@ -332,12 +343,12 @@ class BM25Index:
     @staticmethod
     def tokenize(text: str) -> List[str]:
         """
-        Tokenizzazione avanzata che preserva pattern tecnici:
+        Tokenizzazione Unicode che conserva le lettere accentate e i pattern tecnici:
         - Codici alfanumerici con trattini/punti (es. SN-900, v1.2.0, ISO-9001)
         - Date e orari (es. 2026-09-13, 11434)
         - Parole standard normalizzate in lowercase
         """
-        pattern = r"[a-zA-Z0-9]+(?:[-._/][a-zA-Z0-9]+)*"
+        pattern = r"[^\W_]+(?:[-._/][^\W_]+)*"
         tokens = re.findall(pattern, text.lower())
         return tokens
 
@@ -408,8 +419,10 @@ class VectorStore:
         self.tfidf_vectorizer = None
         self.tfidf_matrix = None
 
-    def _get_embedding(self, text: str) -> Optional[List[float]]:
-        """Chiama l'endpoint embeddings di Ollama."""
+    def _get_embedding(self, text: str, task: str = "search_document") -> Optional[List[float]]:
+        """Chiama Ollama; nomic-embed-text richiede un prefisso diverso per documenti e query."""
+        if "nomic" in self.embed_model:
+            text = f"{task}: {text}"
         try:
             res = requests.post(
                 f"{self.ollama_url}/api/embed",
@@ -430,12 +443,12 @@ class VectorStore:
                 data = res.json()
                 if "embedding" in data:
                     return data["embedding"]
-        except Exception:
+        except (requests.exceptions.RequestException, ValueError):
             pass
         return None
 
     def _calculate_docs_hash(self, docs: Dict[str, List[Tuple[str, Optional[int]]]]) -> str:
-        hasher = hashlib.md5()
+        hasher = hashlib.md5(INDEX_VERSION.encode())
         for fpath in sorted(docs.keys()):
             hasher.update(fpath.encode())
             try:
@@ -447,6 +460,8 @@ class VectorStore:
 
     def build(self, docs: Dict[str, List[Tuple[str, Optional[int]]]], force_reload: bool = False):
         """Costruisce sia l'indice semantico vettoriale sia l'indice lessicale BM25."""
+        self.use_tfidf_fallback = False
+        self.embeddings = None
         splitter = SemanticTextSplitter()
         all_chunks: List[DocumentChunk] = []
         chunk_id = 0
@@ -490,8 +505,8 @@ class VectorStore:
                         f"[dim green][OK] Indice vettoriale e BM25 caricati ({len(self.chunks)} chunk semantici).[/dim green]"
                     )
                     return
-            except Exception:
-                pass
+            except (OSError, ValueError, KeyError) as e:
+                console.print(f"[dim yellow]Cache non utilizzabile, la rigenero: {escape(str(e))}[/dim yellow]")
 
         # Generazione vettori densi con Ollama
         console.print(
@@ -559,13 +574,17 @@ class VectorStore:
         top_k: int = 3,
         dense_weight: float = 0.55,
         bm25_weight: float = 0.45,
-        rrf_k: int = 60
+        rrf_k: int = 60,
+        boost_query: Optional[str] = None
     ) -> List[SearchResult]:
         """
         Esegue la Ricerca Ibrida combinando:
         1. Ricerca Semantica Densa (Cosine Similarity)
         2. Ricerca Lessicale BM25 (per codici, acronimi, numeri e date esatte)
-        3. Reciprocal Rank Fusion (RRF) con boost per token tecnici esatti
+        3. Reciprocal Rank Fusion (RRF) con un piccolo bonus per i codici esatti
+
+        boost_query e' la domanda originale: il testo aggiunto dalla memoria amplia la
+        ricerca ma non deve assegnare il bonus per i codici.
         """
         n_chunks = len(self.chunks)
         if n_chunks == 0:
@@ -578,28 +597,32 @@ class VectorStore:
 
         # 2. Punteggi Densi
         dense_scores = np.zeros(n_chunks, dtype=np.float32)
+        dense_available = False
         if self.use_tfidf_fallback:
+            dense_available = True
             from sklearn.metrics.pairwise import cosine_similarity
             query_vec = self.tfidf_vectorizer.transform([query])
             dense_scores = cosine_similarity(query_vec, self.tfidf_matrix)[0]
         elif self.embeddings is not None:
-            query_emb = self._get_embedding(query)
+            query_emb = self._get_embedding(query, task="search_query")
             if query_emb is not None:
+                dense_available = True
                 q_vec = np.array(query_emb, dtype=np.float32)
                 q_norm = np.linalg.norm(q_vec)
                 if q_norm > 0:
                     q_vec = q_vec / q_norm
                 dense_scores = np.dot(self.embeddings, q_vec)
 
-        # 3. Boost per corrispondenze esatte di codici o date
+        # 3. Bonus per codici esatti, sulla stessa scala dell'RRF: premia ma non sostituisce il ranking
         exact_boost = np.zeros(n_chunks, dtype=np.float32)
-        query_tokens = BM25Index.tokenize(query)
-        for t in query_tokens:
-            is_code_or_num = any(char.isdigit() for char in t) or ("-" in t) or ("." in t) or len(t) > 6
-            if is_code_or_num:
-                for i, chunk in enumerate(self.chunks):
-                    if t in chunk.text.lower():
-                        exact_boost[i] += 0.25  # Forte bonus di posizionamento per codici/date esatte
+        code_bonus = 1.0 / (rrf_k + 1)
+        code_tokens = {
+            t for t in BM25Index.tokenize(boost_query if boost_query is not None else query)
+            if any(char.isdigit() for char in t) or any(sep in t for sep in "-._/")
+        }
+        if code_tokens:
+            for i, chunk in enumerate(self.chunks):
+                exact_boost[i] = code_bonus * len(code_tokens & set(BM25Index.tokenize(chunk.text)))
 
         # 4. RRF (Reciprocal Rank Fusion)
         dense_rank_indices = np.argsort(dense_scores)[::-1]
@@ -614,14 +637,14 @@ class VectorStore:
 
         rrf_scores = np.zeros(n_chunks, dtype=np.float32)
         for i in range(n_chunks):
-            score_dense = dense_weight / (rrf_k + dense_ranks[i])
+            score_dense = (dense_weight / (rrf_k + dense_ranks[i])) if dense_available and dense_scores[i] > 0 else 0.0
             score_bm25 = (bm25_weight / (rrf_k + bm25_ranks[i])) if bm25_scores[i] > 0 else 0.0
             rrf_scores[i] = score_dense + score_bm25 + exact_boost[i]
 
         max_bm25 = float(np.max(bm25_scores)) if np.max(bm25_scores) > 0 else 1.0
         norm_bm25 = bm25_scores / max_bm25
         norm_dense = np.clip(dense_scores, 0.0, 1.0)
-        hybrid_scores = (dense_weight * norm_dense) + (bm25_weight * norm_bm25) + exact_boost
+        hybrid_scores = (dense_weight * norm_dense) + (bm25_weight * norm_bm25)
 
         top_indices = np.argsort(rrf_scores)[::-1][:top_k]
 
@@ -699,8 +722,7 @@ class ConversationMemory:
 
         if is_followup:
             last_turn = self.turns[-1]
-            expanded = f"{query} [Riferimento al contesto precedente: {last_turn.query}]"
-            return expanded
+            return f"{query} {last_turn.query}"
 
         return query
 
@@ -731,7 +753,7 @@ class ResearcherAgent:
     ) -> Tuple[List[SearchResult], str, str]:
         """Esegue il retrieval ibrido e formatta il contesto documentale."""
         search_query = memory.contextualize_query(query)
-        results = self.vector_store.hybrid_search(search_query, top_k=top_k)
+        results = self.vector_store.hybrid_search(search_query, top_k=top_k, boost_query=query)
 
         if not results:
             context_text = "Nessun documento o frammento pertinente reperito nelle fonti locali."
@@ -750,16 +772,14 @@ class ResearcherAgent:
 
 class ValidatorAgent:
     """
-    AGENTE 2 (Validatore / Revisore):
-    - Esamina la bozza generata da DeepSeek-R1 alla luce dei contesti documentali reali
-    - Rileva e segnala allucinazioni o dichiarazioni prive di riscontro nelle fonti
-    - Verifica che le citazioni [Fonte X] siano corrette e presenti
-    - Rilascia un report di validazione fattuale e accuratezza
-    """
+    AGENTE 2 (Validatore): controllo euristico, senza LLM.
+    - Verifica che le citazioni [Fonte X] esistano
+    - Cerca nelle fonti numeri, date e codici presenti nella risposta
+    - Segnala gli elementi non trovati e sostituisce le citazioni inesistenti
 
-    def __init__(self, ollama_url: str = DEFAULT_OLLAMA_URL, model: str = DEFAULT_LLM_MODEL):
-        self.ollama_url = ollama_url
-        self.model = model
+    Limite: non comprende il significato delle frasi, quindi un esito positivo
+    non dimostra che la risposta sia corretta.
+    """
 
     def validate_and_refine(
         self,
@@ -767,73 +787,53 @@ class ValidatorAgent:
         retrieved_results: List[SearchResult],
         question: str
     ) -> Tuple[str, Dict[str, Any]]:
-        """
-        Esegue la validazione euristica e di aderenza fattuale della risposta.
-        Ritorna la risposta validata (o con avvisi di sicurezza) e il resoconto del controllo.
-        """
+        """Ritorna la risposta (con eventuali avvisi) e il resoconto del controllo."""
         report = {
             "is_valid": True,
             "citations_found": [],
-            "hallucinations_detected": 0,
+            "invalid_citations": [],
+            "suspect_tokens": [],
             "verified_tokens": [],
-            "status_message": "Verificata con successo",
-            "confidence": 1.0
+            "status_message": "Nessuna anomalia rilevata dal controllo euristico",
         }
 
         if not retrieved_results:
-            report["status_message"] = "Nessuna fonte documentale disponibile per la verifica"
-            report["confidence"] = 0.5
+            report["is_valid"] = False
+            report["status_message"] = "Nessuna fonte documentale disponibile per il controllo"
             return draft_answer, report
 
-        # 1. Controllo Citazioni Fonti: cerca riferimenti [Fonte 1], [Fonte 2], ecc.
-        citation_matches = re.findall(r"\[Fonte\s*(\d+)\]", draft_answer, re.IGNORECASE)
-        available_sources_count = len(retrieved_results)
-        valid_citations = []
-        invalid_citations = []
+        # 1. Citazioni
+        cited = {int(c) for c in re.findall(r"\[Fonte\s*(\d+)\]", draft_answer, re.IGNORECASE)}
+        available = len(retrieved_results)
+        report["citations_found"] = sorted(c for c in cited if 1 <= c <= available)
+        report["invalid_citations"] = sorted(c for c in cited if not 1 <= c <= available)
 
-        for cit in citation_matches:
-            src_num = int(cit)
-            if 1 <= src_num <= available_sources_count:
-                valid_citations.append(src_num)
-            else:
-                invalid_citations.append(src_num)
+        # 2. Numeri, date e codici: confronto per token interi, cosi' "99" non combacia con "1999"
+        answer_without_citations = re.sub(r"\[Fonte\s*\d+\]", " ", draft_answer, flags=re.IGNORECASE)
+        context_tokens = set()
+        for r in retrieved_results:
+            context_tokens.update(BM25Index.tokenize(r.chunk.text))
+        critical = {
+            t for t in BM25Index.tokenize(answer_without_citations)
+            if any(c.isdigit() for c in t) or any(sep in t for sep in "-._/")
+        }
+        report["verified_tokens"] = sorted(critical & context_tokens)
+        report["suspect_tokens"] = sorted(critical - context_tokens)
 
-        report["citations_found"] = sorted(list(set(valid_citations)))
+        # 3. Esito
+        problems = []
+        for invalid in report["invalid_citations"]:
+            draft_answer = re.sub(rf"\[Fonte\s*{invalid}\]", "[Fonte non presente]", draft_answer, flags=re.IGNORECASE)
+        if report["invalid_citations"]:
+            problems.append(f"citazioni inesistenti: {report['invalid_citations']}")
+        if report["suspect_tokens"]:
+            problems.append(f"valori non trovati nelle fonti: {', '.join(report['suspect_tokens'])}")
+        if not report["citations_found"]:
+            problems.append("nessuna citazione valida")
 
-        # 2. Controllo Preservazione Termini Critici (Codici, Date, Numeri)
-        all_context_text = " ".join([r.chunk.text for r in retrieved_results]).lower()
-        draft_tokens = BM25Index.tokenize(draft_answer)
-        critical_tokens = [
-            t for t in draft_tokens 
-            if (any(c.isdigit() for c in t) or "-" in t or "." in t) and len(t) >= 2
-        ]
-
-        verified_tokens = []
-        suspect_tokens = []
-        for token in critical_tokens:
-            if token in all_context_text:
-                verified_tokens.append(token)
-            else:
-                suspect_tokens.append(token)
-
-        report["verified_tokens"] = list(set(verified_tokens))
-
-        # 3. Controllo Allucinazioni e Correzione
-        if invalid_citations:
-            report["hallucinations_detected"] += len(invalid_citations)
-            for inv in invalid_citations:
-                draft_answer = draft_answer.replace(f"[Fonte {inv}]", f"[Fonte non presente]")
-            report["status_message"] = f"Rilevate citazioni inesistenti rimosse ({invalid_citations})"
-            report["confidence"] -= 0.2
-
-        if len(suspect_tokens) > 3:
-            report["hallucinations_detected"] += 1
-            report["status_message"] = "Possibile disallineamento su alcuni valori numerici o date rispetto ai documenti"
-            report["confidence"] -= 0.15
-
-        if available_sources_count > 0 and not report["citations_found"]:
-            report["status_message"] = "Attenzione: la risposta non riportava citazioni esplicite alle fonti [Fonte X]"
-            report["confidence"] -= 0.1
+        if problems:
+            report["is_valid"] = False
+            report["status_message"] = "Da verificare - " + "; ".join(problems)
 
         return draft_answer, report
 
@@ -855,13 +855,13 @@ class RAGAssistant:
         self.ollama_url = ollama_url.rstrip("/")
         self.llm_model = llm_model
         self.embed_model = embed_model
-        self.directories = directories or [".", "documenti", "docs"]
+        self.directories = directories or DEFAULT_DOC_DIRS
 
         # Componenti architetturali
         self.vector_store = VectorStore(ollama_url=self.ollama_url, embed_model=self.embed_model)
         self.memory = ConversationMemory(max_turns=6)
         self.researcher = ResearcherAgent(vector_store=self.vector_store)
-        self.validator = ValidatorAgent(ollama_url=self.ollama_url, model=self.llm_model)
+        self.validator = ValidatorAgent()
 
         self.last_retrieved_results: List[SearchResult] = []
         self.last_validation_report: Optional[Dict[str, Any]] = None
@@ -909,11 +909,11 @@ class RAGAssistant:
         self.last_retrieved_results = results
 
         if expanded_query != question:
-            console.print(f"[dim]Contestualizzazione memoria: '{expanded_query}'[/dim]")
+            console.print(f"[dim]Contestualizzazione memoria: '{escape(expanded_query)}'[/dim]")
 
         # Prompt di sistema rigido per accuratezza fattuale
         system_prompt = (
-            "Sei un assistente RAG aziendale di altissima precisione con supporto multi-agente. "
+            "Sei un assistente RAG aziendale. "
             "Rispondi in lingua italiana in modo chiaro, esaustivo e strutturato. "
             "DEVI BASARE LA TUA RISPOSTA ESCLUSIVAMENTE SUL CONTESTO DOCUMENTALE FORNITO. "
             "Non fare supposizioni e non inventare dati assenti dalle fonti. "
@@ -955,7 +955,7 @@ class RAGAssistant:
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
-            console.print(f"[bold red]Errore nella connessione a Ollama: {e}[/bold red]")
+            console.print(f"[bold red]Errore nella connessione a Ollama: {escape(str(e))}[/bold red]")
             return ""
 
         in_thinking = False
@@ -998,7 +998,7 @@ class RAGAssistant:
                             idx = buffer.find("</think>")
                             think_part = buffer[:idx]
                             if show_thinking:
-                                console.print(think_part, end="", style="dim italic cyan")
+                                console.print(think_part, end="", style="dim italic cyan", markup=False)
                             thinking_text += think_part
                             in_thinking = False
                             buffer = buffer[idx + 8:]
@@ -1008,16 +1008,16 @@ class RAGAssistant:
                             if "<" in buffer and len(buffer) < 8:
                                 break
                             if show_thinking:
-                                console.print(buffer, end="", style="dim italic cyan")
+                                console.print(buffer, end="", style="dim italic cyan", markup=False)
                             thinking_text += buffer
                             buffer = ""
 
-            except Exception:
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
 
         if buffer:
             if in_thinking and show_thinking:
-                console.print(buffer, end="", style="dim italic cyan")
+                console.print(buffer, end="", style="dim italic cyan", markup=False)
             else:
                 draft_answer += buffer
 
@@ -1025,7 +1025,7 @@ class RAGAssistant:
 
         # FASE 2: Validatore / Revisore (Agente 2)
         if validate:
-            console.print("[bold green]🛡️ Agente 2 (Validatore/Revisore):[/bold green] Verifica fedeltà fonti e anti-allucinazione...")
+            console.print("[bold green]🛡️ Agente 2 (Validatore/Revisore):[/bold green] Controllo di citazioni, numeri e codici...")
             validated_answer, report = self.validator.validate_and_refine(
                 draft_answer=draft_answer,
                 retrieved_results=results,
@@ -1034,19 +1034,20 @@ class RAGAssistant:
             self.last_validation_report = report
         else:
             validated_answer = draft_answer
-            report = {"status_message": "Validazione disattivata", "confidence": 1.0}
+            report = {"status_message": "Validazione disattivata"}
 
         # Stampa della risposta finale validata
-        console.print(f"\n[bold green]Risposta Finale Validata:[/bold green]")
+        console.print(f"\n[bold green]Risposta:[/bold green]")
         console.print(Markdown(validated_answer))
 
         # Stampa badge di validazione
         if validate and self.last_validation_report:
-            status_style = "green" if self.last_validation_report.get("hallucinations_detected", 0) == 0 else "yellow"
-            cit_info = f"Fonti citate: {self.last_validation_report.get('citations_found') or 'N/A'}"
-            ver_info = f"Termini verificati: {len(self.last_validation_report.get('verified_tokens', []))}"
-            msg = f"[{status_style}]Stato: {self.last_validation_report.get('status_message')} | {cit_info} | {ver_info}[/{status_style}]"
-            console.print(Panel(msg, title="Certificato di Validazione Agente 2", border_style=status_style, expand=False))
+            status_style = "green" if self.last_validation_report.get("is_valid") else "yellow"
+            cit_info = f"Fonti citate: {self.last_validation_report.get('citations_found') or 'nessuna'}"
+            ver_info = f"Valori trovati nelle fonti: {len(self.last_validation_report.get('verified_tokens', []))}"
+            status = escape(str(self.last_validation_report.get("status_message")))
+            msg = f"[{status_style}]{status} | {escape(cit_info)} | {ver_info}[/{status_style}]"
+            console.print(Panel(msg, title="Controllo euristico - non e' una prova di correttezza", border_style=status_style, expand=False))
 
         # Aggiorna la memoria di conversazione
         self.memory.add_turn(query=question, response=validated_answer, sources=results)
@@ -1081,12 +1082,12 @@ class RAGAssistant:
                 preview = preview[:72] + "..."
             table.add_row(
                 str(i),
-                fname,
+                escape(fname),
                 pag,
                 f"{res.hybrid_score:.3f}",
                 f"{res.dense_score:.3f}",
                 f"{res.bm25_score:.1f}",
-                preview
+                escape(preview)
             )
 
         console.print(table)
@@ -1096,14 +1097,14 @@ class RAGAssistant:
 # 9. INTERFACCIA INTERATTIVA CON MEMORIA
 # =====================================================================
 
-def run_interactive_shell(assistant: RAGAssistant, top_k: int = 3, show_thinking: bool = True):
+def run_interactive_shell(assistant: RAGAssistant, top_k: int = 3, show_thinking: bool = True, validate: bool = True):
     """Avvia la sessione interattiva con memoria, hybrid search e multi-agente."""
     console.print(Panel(
-        f"[bold cyan]Sistema RAG Avanzato Multi-Agente & Hybrid Search[/bold cyan]\n"
+        f"[bold cyan]Sistema RAG locale con ricerca ibrida[/bold cyan]\n"
         f"Modello LLM: [bold yellow]{assistant.llm_model}[/bold yellow] | "
         f"Embedding: [bold green]{assistant.embed_model}[/bold green] | "
         f"Motore Lessicale: [bold magenta]BM25Okapi[/bold magenta]\n"
-        f"Agente 1: [cyan]Ricercatore Ibrido[/cyan] | Agente 2: [green]Validatore Anti-Allucinazione[/green]\n"
+        f"Agente 1: [cyan]Ricercatore Ibrido[/cyan] | Agente 2: [green]Controllo euristico[/green]\n"
         f"Documenti indicizzati: [bold]{len(assistant.vector_store.chunks)} chunk semantici[/bold]\n\n"
         f"[dim]Comandi disponibili:[/dim]\n"
         f" * [bold white]fonti[/bold white]     : Dettagli su ranking ibrido, dense e BM25 usati per l'ultima risposta\n"
@@ -1112,7 +1113,7 @@ def run_interactive_shell(assistant: RAGAssistant, top_k: int = 3, show_thinking
         f" * [bold white]ricarica[/bold white]  : Riscansiona i documenti e ricostruisce gli indici vettoriali/BM25\n"
         f" * [bold white]think[/bold white]     : Attiva/disattiva il pensiero di DeepSeek-R1 (<think>)\n"
         f" * [bold white]esci[/bold white]      : Termina la sessione",
-        title="RAG Multi-Agent Shell Interattiva",
+        title="RAG - Shell Interattiva",
         border_style="cyan"
     ))
 
@@ -1164,7 +1165,7 @@ def run_interactive_shell(assistant: RAGAssistant, top_k: int = 3, show_thinking
                 os.system("cls" if os.name == "nt" else "clear")
                 continue
 
-            assistant.query(question, top_k=top_k, show_thinking=show_thinking)
+            assistant.query(question, top_k=top_k, show_thinking=show_thinking, validate=validate)
             assistant.print_sources_table()
 
         except (KeyboardInterrupt, EOFError):
@@ -1178,7 +1179,7 @@ def run_interactive_shell(assistant: RAGAssistant, top_k: int = 3, show_thinking
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Sistema RAG avanzato multi-agente con Hybrid Search (BM25 + Vettoriale) per documenti TXT e PDF."
+        description="Sistema RAG locale con ricerca ibrida (BM25 + vettoriale) per documenti TXT, PDF e MD."
     )
     parser.add_argument(
         "query",
@@ -1188,7 +1189,7 @@ def main():
     parser.add_argument(
         "--docs-dir", "-d",
         nargs="+",
-        default=[".", "documenti", "docs"],
+        default=DEFAULT_DOC_DIRS,
         help="Directory o percorsi dei file da includere nell'analisi RAG."
     )
     parser.add_argument(
@@ -1243,7 +1244,7 @@ def main():
 
     # Esecuzione query singola o shell interattiva
     if args.query:
-        console.print(f"[bold cyan]Domanda:[/bold cyan] {args.query}\n")
+        console.print(f"[bold cyan]Domanda:[/bold cyan] {escape(args.query)}\n")
         assistant.query(
             args.query,
             top_k=args.top_k,
@@ -1252,7 +1253,12 @@ def main():
         )
         assistant.print_sources_table()
     else:
-        run_interactive_shell(assistant, top_k=args.top_k, show_thinking=not args.no_thinking)
+        run_interactive_shell(
+            assistant,
+            top_k=args.top_k,
+            show_thinking=not args.no_thinking,
+            validate=not args.no_validation,
+        )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,14 @@
+[
+ {"domanda": "Quali temperature sopporta il sensore SN-900?", "fonte": "scheda_dispositivi.pdf", "testo": "SN-900"},
+ {"domanda": "Quanto dura la batteria al litio?", "fonte": "scheda_dispositivi.pdf", "testo": "36 mesi"},
+ {"domanda": "Chi è il coordinatore tecnico?", "fonte": "guida_progetto.txt", "testo": "Marco Rossi"},
+ {"domanda": "Ogni quanto vengono rilasciati gli aggiornamenti?", "fonte": "guida_progetto.txt", "testo": "ogni due settimane"},
+ {"domanda": "Quale versione è uscita a settembre 2026?", "fonte": "guida_progetto.txt", "testo": "v1.2.0"},
+ {"domanda": "Qual è l'obiettivo del Progetto Aurora?", "fonte": "guida_progetto.txt", "testo": "riservatezza"},
+ {"domanda": "Quanti caratteri ha di solito un segmento di testo?", "fonte": "guida_progetto.txt", "testo": "600 caratteri"},
+ {"domanda": "Quale modello genera gli embedding?", "fonte": "guida_progetto.txt", "testo": "nomic-embed-text"},
+ {"domanda": "Quale temperatura usare per i compiti creativi?", "fonte": "guida_progetto.txt", "testo": "0.7"},
+ {"domanda": "Su quale porta risponde Ollama?", "fonte": "guida_progetto.txt", "testo": "11434"},
+ {"domanda": "Cosa registrano i log di audit?", "fonte": "guida_progetto.txt", "testo": "log di audit"},
+ {"domanda": "Cosa fare se il recupero del contesto presenta anomalie?", "fonte": "guida_progetto.txt", "testo": "ricarica"}
+]

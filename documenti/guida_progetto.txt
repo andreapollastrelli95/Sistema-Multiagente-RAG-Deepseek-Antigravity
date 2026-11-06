@@ -1,0 +1,26 @@
+# Progetto Aurora: Linee Guida e Architettura del Sistema
+
+## 1. Obiettivo del Progetto
+Il Progetto Aurora è una piattaforma intelligente per la gestione e l'elaborazione dei flussi documentali aziendali basata su modelli linguistici locali e ricerca ibrida (RAG). L'obiettivo primario è garantire la massima riservatezza dei dati aziendali, evitando che informazioni sensibili vengano inviate a server cloud di terze parti.
+
+## 2. Architettura del Sistema
+L'architettura si articola in quattro componenti principali:
+1. **Document Ingestion Layer**: Scansiona directory di rete e cartelle locali per acquisire file in formato .txt, .pdf, e .md.
+2. **Chunking & Preprocessing**: Suddivide i testi in segmenti semanticamente coerenti (lunghezza tipica 600 caratteri, sovrapposizione 120 caratteri) per preservare i riferimenti incrociati.
+3. **Vector Database & Embeddings**: Utilizza il modello `nomic-embed-text` eseguito tramite il server Ollama locale. I vettori ad alta densità (768 dimensioni) vengono indicizzati con similarità del coseno.
+4. **Reasoning & Inference Engine**: Si appoggia al modello `deepseek-r1:8b` in esecuzione su Ollama locale (porta 11434). Il modello adotta una fase di ragionamento esplicito (chain-of-thought) prima di produrre la risposta finale per l'operatore.
+
+## 3. Parametri di Configurazione Consigliati
+- **Modello LLM**: `deepseek-r1:8b`
+- **Modello Embedding**: `nomic-embed-text`
+- **Temperatura di generazione**: 0.2 per compiti di estrazione fattuale e RAG, 0.7 per compiti creativi.
+- **Top-K Retrieval**: 3 frammenti rilevanti per query standard.
+- **Porta Ollama**: 11434 (localhost).
+
+## 4. Requisiti di Sicurezza e Riservatezza
+- Nessun dato viene trasmesso all'esterno della LAN aziendale.
+- La cache dei vettori è salvata localmente in un file cifrato o protetto dai permessi dell'utente del sistema operativo.
+- I log di audit registrano l'utente, la data, l'ora e il documento citato, ma non il testo integrale delle query.
+
+## 5. Manutenzione e Aggiornamenti
+Il team di manutenzione guidato dal coordinatore tecnico Marco Rossi rilascia aggiornamenti ogni due settimane, con codice di versione progressivo (es. v1.2.0 rilasciata a settembre 2026). In caso di anomalie nel recupero del contesto, è consigliato svuotare la cache degli embedding tramite il comando `ricarica`.

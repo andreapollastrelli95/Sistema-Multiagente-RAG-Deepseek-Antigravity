@@ -1,0 +1,5 @@
+requests>=2.31
+numpy>=1.26
+rich>=13.7
+pypdf>=4.0
+scikit-learn>=1.4
